@@ -23,9 +23,39 @@ The Andy.Tools integration (the `dataframe_*` LLM tools) lives separately as `An
 - **Resource governance & cancellation.** Host-set memory limit (DuckDB `memory_limit` + spill) and cooperative cancellation through loaders and transforms.
 - **Concurrency.** Thread-safe: one backend instance == one DuckDB connection used under a lock (safe to call concurrently; parallelism is intra-query). Use one backend instance per stream for inter-query parallelism.
 
+## Operation API
+
+All 28 operations are available as a framework-independent API. Use the `DataFrameEngine` facade and dispatch by operation id, passing a parameters dictionary and getting back a `DataFrameResponse`:
+
+```csharp
+using Andy.Data.Operations;
+
+using var engine = new DataFrameEngine(); // fresh in-memory DuckDB backend + catalog
+
+engine.Execute("dataframe_load_csv", new Dictionary<string, object?>
+{
+    ["path"] = "data/sales.csv", ["dataset_id"] = "sales",
+});
+
+var byRegion = engine.Execute("dataframe_group_by", new Dictionary<string, object?>
+{
+    ["dataset_id"] = "sales", ["group_by"] = new[] { "region" },
+    ["aggregations"] = new object[]
+    {
+        new Dictionary<string, object?> { ["column"] = "amount", ["function"] = "sum", ["alias"] = "total" },
+    },
+});
+
+if (byRegion.Success) { /* byRegion.Schema, byRegion.RowCount, byRegion.PreviewRows, byRegion.Warnings, byRegion.Stats */ }
+```
+
+Each operation is also usable directly (e.g. `new FilterOperation(backend, catalog).Execute(parameters, options)`); resource limits and cancellation are passed via `DataFrameExecuteOptions`. Parameters are validated against each operation's declared schema (`DataFrameParameterValidator`) before the body runs, producing the documented error codes — no tool-framework dependency.
+
+The 28 operations: load_csv/json/parquet/delta, schema, profile, preview, value_counts, assert, select, filter, with_column, rename, group_by, window, pivot, unpivot, unnest, join, sample, sort, distinct, union, fillna, dropna, export, list, drop.
+
 ## Status
 
-This repository currently hosts the **engine core** (backend, SQL renderers, predicate/expression parsers, and the response/error envelope), building and tested across Ubuntu/macOS/Windows. The full framework-independent **operation API** (the migration of the 28 `filter`/`group_by`/`join`/… operations into this library, with a framework-free parameter validator) is in progress — see [MIGRATION.md](MIGRATION.md).
+The framework-independent **engine + operation API** is complete and tested across Ubuntu/macOS/Windows. The `Andy.Tools.Data` integration (the `dataframe_*` LLM tools, shipped from the `andy-tools` repo) and the archival of `andy-tools-dataframe` are the remaining phases — see [MIGRATION.md](MIGRATION.md).
 
 ## Build & test
 
