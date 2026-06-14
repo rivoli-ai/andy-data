@@ -1,0 +1,51 @@
+<Project>
+  <PropertyGroup>
+    <CurrentYear>$([System.DateTime]::Now.ToString("yyyy"))</CurrentYear>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <!-- Versioning: unique pre-release suffixes per CI run; plain alpha for local builds. -->
+    <VersionPrefix>1.0.0</VersionPrefix>
+    <VersionSuffix Condition="'$(GITHUB_REF)' == 'refs/heads/develop' AND '$(GITHUB_RUN_NUMBER)' != ''">beta.$(GITHUB_RUN_NUMBER)</VersionSuffix>
+    <VersionSuffix Condition="'$(GITHUB_REF)' == 'refs/heads/develop' AND '$(GITHUB_RUN_NUMBER)' == ''">beta</VersionSuffix>
+    <VersionSuffix Condition="'$(GITHUB_REF)' == 'refs/heads/main' AND '$(GITHUB_RUN_NUMBER)' != ''">alpha.$(GITHUB_RUN_NUMBER)</VersionSuffix>
+    <VersionSuffix Condition="'$(VersionSuffix)' == ''">alpha</VersionSuffix>
+
+    <!-- Common Package Properties -->
+    <Authors>Rivoli AI</Authors>
+    <Company>Rivoli AI</Company>
+    <Product>Andy Data</Product>
+    <Copyright>Copyright © $(CurrentYear) $(Company)</Copyright>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/rivoli-ai/andy-data</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/rivoli-ai/andy-data</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>dataframe;duckdb;parquet;delta;analytics;dotnet;data</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+
+    <!-- Build Configuration -->
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+
+    <!-- Code Quality -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn> <!-- Missing XML comment for publicly visible type or member -->
+  </PropertyGroup>
+
+  <!-- Pack the repo README into every packable project (PackageReadmeFile is set globally above).
+       Test projects opt out via IsPackable=false; item conditions evaluate after all properties,
+       so the project-level IsPackable value is respected here. -->
+  <ItemGroup Condition="'$(IsPackable)' != 'false'">
+    <None Include="$(MSBuildThisFileDirectory)README.md" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
+
+  <!-- Source Link -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
+  </ItemGroup>
+</Project>

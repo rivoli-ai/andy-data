@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <!-- NuGet Package Metadata -->
+    <PackageId>Andy.Data</PackageId>
+    <Title>Andy Data</Title>
+    <Description>A structured, deterministic dataframe engine backed by DuckDB (CSV, JSON, Parquet, partitioned Parquet, Delta Lake). Framework-independent core: load, transform, aggregate, join, reshape, and export tabular data through a closed, injection-safe operation vocabulary — no SQL or code execution required. Tool-framework integrations build on top of this.</Description>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.2" />
+    <!-- DuckDB backend (embedded, vectorized analytical engine). -->
+    <PackageReference Include="DuckDB.NET.Data.Full" Version="1.1.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Andy.Data.Abstractions\Andy.Data.Abstractions.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Andy.Data.Tests" />
+  </ItemGroup>
+
+</Project>

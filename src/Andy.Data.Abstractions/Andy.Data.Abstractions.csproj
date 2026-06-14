@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <!-- NuGet Package Metadata -->
+    <PackageId>Andy.Data.Abstractions</PackageId>
+    <Title>Andy Data — Abstractions</Title>
+    <Description>Framework-independent contract types for Andy Data: the response envelope, error codes, dataset catalog, and the structured predicate/expression models and parsers. No dependency on any tool framework or DuckDB.</Description>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+  </PropertyGroup>
+
+</Project>

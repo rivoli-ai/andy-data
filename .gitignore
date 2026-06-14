@@ -1,0 +1,76 @@
+## .gitignore for the Andy Tools DataFrame .NET project.
+## Based on https://github.com/github/gitignore/blob/main/Dotnet.gitignore
+
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+# .NET Core
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# NuGet Packages
+*.nupkg
+*.snupkg
+# The packages folder can be ignored because of Package Restore
+**/[Pp]ackages/*
+# except build/, which is used as an MSBuild target
+!**/[Pp]ackages/build/
+
+# Test coverage and results
+coverage/
+coveragereport/
+coverage-results/
+coverage-results-*/
+[Tt]est-[Rr]esult*/
+[Tt]est[Rr]esult*/
+TestResult.xml
+nunit-*.xml
+*.VisualState.xml
+
+# MSBuild Binary and Structured Log
+*.binlog
+
+# DuckDB / data engine artifacts
+*.duckdb
+*.duckdb.wal
+*.db.wal
+*.tmp.parquet
+
+# Test fixtures generated at runtime (large tiers are not committed)
+tests/**/tmp/
+tests/**/.fixtures/
+**/generated-data/
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*~
+~$*
+
+# OS
+.DS_Store
+**/.DS_Store
+Thumbs.db
+
+# Agent worktrees (created by the Agent tool)
+.claude/worktrees/
+
+# Local git worktrees
+.worktrees/
