@@ -2,7 +2,20 @@
 
 A structured, deterministic **dataframe engine** backed by [DuckDB](https://duckdb.org/), with **no dependency on any tool framework**. Load, transform, aggregate, join, reshape, and export tabular data (CSV, JSON, Parquet, partitioned Parquet, Delta Lake) through a closed, injection-safe vocabulary — no model-supplied SQL or code execution.
 
-> **ALPHA**. No guarantees about functionality, stability, or safety. Query results have not been fully validated across all types/formats. Do not use in production or for decisions on critical data without independent verification. Use at your own risk. Licensed under [Apache 2.0](LICENSE).
+> **ALPHA RELEASE WARNING**
+>
+> This software is in ALPHA stage. **NO GUARANTEES** are made about its functionality, stability, or safety.
+>
+> **CRITICAL WARNINGS:**
+> - Query results have **NOT BEEN FULLY VALIDATED** across all data types and formats
+> - Schema inference and type coercion may behave unexpectedly on malformed inputs
+> - **DO NOT USE** in production environments
+> - **DO NOT USE** for decisions on critical or irreplaceable data without independent verification
+> - The authors assume **NO RESPONSIBILITY** for incorrect results, data loss, or damages
+>
+> **USE AT YOUR OWN RISK**
+
+Licensed under the [Apache License 2.0](LICENSE).
 
 ## What this is
 
@@ -53,9 +66,24 @@ Each operation is also usable directly (e.g. `new FilterOperation(backend, catal
 
 The 28 operations: load_csv/json/parquet/delta, schema, profile, preview, value_counts, assert, select, filter, with_column, rename, group_by, window, pivot, unpivot, unnest, join, sample, sort, distinct, union, fillna, dropna, export, list, drop.
 
+## Documentation
+
+Full technical documentation lives in [`docs/`](docs/README.md):
+
+- [Getting Started](docs/getting-started.md) — build, construct an engine, run your first operation
+- [Core Concepts](docs/core-concepts.md) — datasets, the catalog, the response envelope, lifecycle
+- [Architecture](docs/architecture.md) — layers, SQL rendering, the DuckDB backend
+- [Operations Reference](docs/operations.md) — every operation, with parameters and the predicate/expression grammars
+- [Response Envelope Contract](docs/tool-contract.md) — the stable success/failure shape and error codes
+- [Reliability](docs/reliability.md) — determinism, schema handling, and the error contract
+- [Security](docs/security.md) — the injection-free model and the `IPathPolicy` filesystem gate
+- [Troubleshooting](docs/troubleshooting.md) — common issues and resolutions
+
+Runnable end-to-end samples are in [`examples/`](examples/README.md).
+
 ## Status
 
-The framework-independent **engine + operation API** is complete and tested across Ubuntu/macOS/Windows. The `Andy.Tools.Data` integration (the `dataframe_*` LLM tools, shipped from the `andy-tools` repo) and the archival of `andy-tools-dataframe` are the remaining phases — see [MIGRATION.md](MIGRATION.md).
+The framework-independent **engine + operation API** is complete and tested across Ubuntu/macOS/Windows. The Andy.Tools integration (the `dataframe_*` LLM tools, `Andy.Tools.Data`) ships separately from the [`andy-tools`](https://github.com/rivoli-ai/andy-tools) repo and builds on this package; the original [`andy-tools-dataframe`](https://github.com/rivoli-ai/andy-tools-dataframe) repo is being archived in favor of this split.
 
 ## Build & test
 
@@ -63,3 +91,14 @@ The framework-independent **engine + operation API** is complete and tested acro
 dotnet build
 dotnet test
 ```
+
+## Examples
+
+```bash
+dotnet run --project examples/Andy.Data.Examples       # run the full scenario suite
+dotnet run --project examples/Andy.Data.Examples -- list
+```
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
