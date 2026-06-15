@@ -1,0 +1,126 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  NUGET_SOURCE: 'https://api.nuget.org/v3/index.json'
+  # Force JS actions onto Node 24 even if an action still declares Node 20
+  # (e.g. actions/upload-artifact). Matches the runner default from 2026-06-16.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        fetch-depth: 0 # Important for versioning / Source Link
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v5
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Restore dependencies
+      run: dotnet restore
+
+    - name: Build
+      run: dotnet build --configuration Release --no-restore
+
+    - name: Test
+      run: dotnet test --configuration Release --no-build --verbosity normal --collect:"XPlat Code Coverage"
+
+    - name: Pack
+      run: |
+        # Determine version: vX.Y.Z tag -> release; main/dispatch -> dated RC.
+        if [[ $GITHUB_REF == refs/tags/v* ]]; then
+          VERSION=${GITHUB_REF#refs/tags/v}
+        else
+          VERSION=$(date +%Y.%m.%d)-rc.$GITHUB_RUN_NUMBER
+        fi
+
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
+        echo "Packing version $VERSION"
+
+        # Andy.Data depends on Andy.Data.Abstractions at the exact same version,
+        # so both packages are packed and published together.
+        for proj in \
+          src/Andy.Data.Abstractions/Andy.Data.Abstractions.csproj \
+          src/Andy.Data/Andy.Data.csproj; do
+          dotnet pack "$proj" \
+            --configuration Release \
+            --no-build \
+            --output ./artifacts \
+            -p:PackageVersion=$VERSION
+        done
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v5
+      with:
+        name: nuget-packages
+        path: ./artifacts/*
+        retention-days: 7
+
+  publish-prerelease:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Download artifacts
+      uses: actions/download-artifact@v5
+      with:
+        name: nuget-packages
+        path: ./artifacts
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v5
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Publish to NuGet
+      run: |
+        dotnet nuget push "./artifacts/*.nupkg" \
+          --source ${{ env.NUGET_SOURCE }} \
+          --api-key ${{ secrets.NUGET_API_KEY }} \
+          --skip-duplicate
+
+  publish-release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+    - name: Download artifacts
+      uses: actions/download-artifact@v5
+      with:
+        name: nuget-packages
+        path: ./artifacts
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v5
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Publish to NuGet
+      run: |
+        dotnet nuget push "./artifacts/*.nupkg" \
+          --source ${{ env.NUGET_SOURCE }} \
+          --api-key ${{ secrets.NUGET_API_KEY }} \
+          --skip-duplicate
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: ./artifacts/*
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
