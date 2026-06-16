@@ -16,6 +16,21 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      # 'true' when this push/PR touches library source — gates the RC publish below
+      # so docs-only / benchmark-only changes don't cut a new NuGet prerelease.
+      src: ${{ steps.filter.outputs.src }}
+    steps:
+    - uses: actions/checkout@v5
+    - uses: dorny/paths-filter@v3
+      id: filter
+      with:
+        filters: |
+          src:
+            - 'src/**'
+
   build:
     runs-on: ubuntu-latest
 
@@ -70,9 +85,10 @@ jobs:
         retention-days: 7
 
   publish-prerelease:
-    needs: build
+    needs: [build, changes]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    # Only publish a dated RC when pushing to main AND library source changed.
+    if: github.ref == 'refs/heads/main' && needs.changes.outputs.src == 'true'
 
     steps:
     - name: Download artifacts
