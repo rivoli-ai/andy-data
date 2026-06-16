@@ -1,635 +1,846 @@
-# Operations reference
+# Operations Reference
 
-All 28 operations, grouped by category. Every operation is dispatched through the engine by id and
-returns the [standard response envelope](tool-contract.md):
+> **Operations** — the first pillar. This is the complete catalog of dataframe operations, organized by category. Every operation is framework-independent: there is no tool framework, no DI container, and no permission subsystem in this repo. You dispatch an operation by id through the engine facade —
+>
+> ```csharp
+> using var engine = new DataFrameEngine();      // fresh in-memory DuckDB backend + catalog
+> DataFrameResponse r = engine.Execute(operationId, parameters, options);
+> ```
+>
+> — and every call returns the same [common response envelope](tool-contract.md), a `DataFrameResponse` whose typed properties you read directly (`r.Success`, `r.Schema`, `r.RowCount`, `r.PreviewRows`, `r.Warnings`, `r.Stats`, or on failure `r.ErrorCode` / `r.Message`). Calls are **synchronous** — they return a `DataFrameResponse`, not a `Task`.
+
+Operations are **orthogonal and composable**: each does one thing, produces a named dataset, and chains into the next. Coverage comes from composition, not from a large surface area. The core set below is drawn from relational algebra (select, filter, join, group-by, sort, distinct, union) plus the analytical extensions (window, pivot) that cover the large majority of real workflows.
+
+## The engine API
 
 ```csharp
-var response = engine.Execute("dataframe_<op>", parameters, options);
+using Andy.Data;             // DataFrameResponse, ColumnSchema, DataFrameStats, DataFrameErrorCodes, IPathPolicy
+using Andy.Data.Operations;  // DataFrameEngine, DataFrameExecuteOptions, *Operation classes
+using Andy.Data.Backend;     // IDuckDbBackend, DuckDbBackend
+using Andy.Data.Predicates;  // PredicateNode, PredicateParser
+using Andy.Data.Expressions; // ExprNode, ExpressionParser
+
+using var engine = new DataFrameEngine();   // owns its backend; disposing closes it
+
+var r = engine.Execute("dataframe_load_csv", new Dictionary<string, object?>
+{
+    ["path"] = "data/sales.csv",
+    ["dataset_id"] = "sales",
+});
+
+if (r.Success)
+{
+    Console.WriteLine($"{r.DatasetId}: {r.RowCount} rows, {r.Schema.Count} columns");
+    foreach (var col in r.Schema)
+        Console.WriteLine($"  {col.Name}: {col.Type} (nullable={col.Nullable})");
+    foreach (var w in r.Warnings)
+        Console.WriteLine($"  warning: {w}");
+}
+else
+{
+    Console.WriteLine($"[{r.ErrorCode}] {r.Message}");
+}
 ```
 
-Conventions used below:
+**`DataFrameResponse`** (class, namespace `Andy.Data`) — one shape for success and failure:
 
-- **Required** parameters are marked •; everything else is optional with its default shown.
-- `dataset_id` and `into` ids must match `^[A-Za-z_][A-Za-z0-9_]{0,127}$`.
-- Most transforms accept `into` (the output id) and default to **replacing** `dataset_id` in place
-  when it is omitted. `join`, `union`, and `rename` **require** `into`.
-- `explain` (boolean, default `false`) is available on every transform; when `true` the DuckDB query
-  plan is returned in `stats.plan`.
-- Remember the [lazy-view model](concepts.md#lazy-views-read-this-for-performance): transforms compose
-  into one fused plan and are not materialized until a terminal (count/preview/export) runs.
+| Property | Type | Meaning |
+|----------|------|---------|
+| `Success` | `bool` | Whether the operation succeeded. |
+| `DatasetId` | `string?` | The resulting dataset id (`into`, or the input `dataset_id` it replaced). |
+| `Schema` | `IReadOnlyList<ColumnSchema>` | Ordered output columns. `ColumnSchema` is `record(string Name, string Type, bool Nullable = true)`. |
+| `RowCount` | `long?` | Row count of the result. |
+| `PreviewRows` | `IReadOnlyList<IReadOnlyDictionary<string, object?>>` | A bounded set of result rows. |
+| `PreviewTruncated` | `bool` | `true` when more rows exist than were previewed. |
+| `Warnings` | `IReadOnlyList<string>` | Non-fatal notes (coercions, data-quality summaries, …). |
+| `Stats` | `DataFrameStats?` | `record(long ElapsedMs, long BytesScanned, long RowsProduced, string? Plan = null)`. |
+| `ErrorCode` | `string?` | On failure, one of the [error codes](#error-codes). |
+| `Message` | `string?` | On failure, a human-readable explanation. |
+| `Details` | `IReadOnlyDictionary<string, object?>?` | On failure, optional structured context. |
 
-**Categories**
+**`DataFrameExecuteOptions`** (namespace `Andy.Data.Operations`) — per-call resource governance and cancellation:
 
-- [Loading](#loading) — `load_csv`, `load_json`, `load_parquet`, `load_delta`
-- [Inspection](#inspection) — `schema`, `preview`, `profile`, `value_counts`, `assert`, `list`
-- [Projection & row selection](#projection--row-selection) — `select`, `filter`, `with_column`, `rename`
-- [Aggregation & analytics](#aggregation--analytics) — `group_by`, `window`
-- [Reshaping](#reshaping) — `pivot`, `unpivot`, `unnest`
-- [Combining](#combining) — `join`, `union`
-- [Ordering, sampling & dedup](#ordering-sampling--dedup) — `sort`, `sample`, `distinct`
-- [Missing data](#missing-data) — `fillna`, `dropna`
-- [Output & lifecycle](#output--lifecycle) — `export`, `drop`
+- `long? MaxMemoryBytes` — DuckDB `memory_limit` in bytes; `null` or non-positive means unset.
+- `int? MaxExecutionTimeMs` — wall-clock cap; a positive value cancels the operation (`CANCELLED`) after that many milliseconds.
+- `CancellationToken CancellationToken` — caller cancellation.
+- `static readonly DataFrameExecuteOptions Default` — no limits, no cancellation. Passed implicitly when you omit the third argument to `Execute`.
 
-Grammars: [predicate trees](#predicate-trees) · [expression trees](#expression-trees) ·
-[aggregation functions](#aggregation-functions) · [window functions](#window-functions)
+```csharp
+var r = engine.Execute("dataframe_group_by", parameters, new DataFrameExecuteOptions
+{
+    MaxExecutionTimeMs = 30_000,
+    MaxMemoryBytes = 2L * 1024 * 1024 * 1024,
+    CancellationToken = ct,
+});
+```
+
+### Calling an operation directly (no facade)
+
+The facade simply constructs each operation once and dispatches by id. You can instead construct a single operation against your own backend and catalog and call its `Execute` directly — the same envelope comes back:
+
+```csharp
+using var backend = new DuckDbBackend();
+var catalog = new InMemoryDatasetCatalog();
+var r = new FilterOperation(backend, catalog).Execute(parameters, DataFrameExecuteOptions.Default);
+```
+
+Loaders and `dataframe_export` additionally accept an `IPathPolicy?` constructor argument to restrict which paths they may read or write (see [security.md](security.md)); the engine forwards the policy you pass to `new DataFrameEngine(pathPolicy)`.
+
+## Conventions
+
+- **`dataset_id`** (string, required on most ops): the input dataset.
+- **`into`** (string, optional): the output dataset id. If omitted, the result replaces `dataset_id`.
+- All operations are read-only with respect to source files; only `dataframe_export` writes.
+- Column identifiers are validated against the dataset schema before execution.
+- **`explain`** (boolean, optional, default `false`): accepted by the sixteen transformation operations — `select`, `filter`, `with_column`, `join`, `group_by`, `window`, `pivot`, `unpivot`, `unnest`, `sort`, `distinct`, `union`, `sample`, `fillna`, `dropna`, `rename`. When `true`, the DuckDB query plan is included in `r.Stats.Plan` (the `stats.plan` envelope field) without changing the result. See [architecture.md](architecture.md#explain-plans).
+- See [Predicate trees](#predicate-trees) and [Expression trees](#expression-trees) for the structured grammars used by `filter` and `with_column`.
 
 ---
 
 ## Loading
 
-The loaders register a new session-scoped dataset from a file or glob. Format-specific options (CSV
-dialect, JSON layout, Parquet partitioning, Delta time travel) are detailed in
-[file-formats.md](file-formats.md). Loads honor the [path policy](concepts.md#path-policy) and the
-[memory limit](concepts.md#resource-governance--cancellation).
+### dataframe_load_csv
 
-### `dataframe_load_csv`
+Load a CSV file (or glob) into a session dataset. Types are inferred unless overridden by `columns`.
 
-Loads a CSV file (or glob such as `data/*.csv`) into a named dataset. Column types are inferred by
-sampling, unless overridden per column.
+**Parameters:**
+- `path` (string, required): File path or glob (e.g. `data/*.csv`).
+- `dataset_id` (string, required): Id to register the dataset under.
+- `header` (boolean, optional, default: auto-detect): First row contains column names.
+- `delimiter` (string, optional, default: auto-detect): Field delimiter.
+- `quote` (string, optional, default: auto-detect): Quote character — exactly one character.
+- `null_string` (string, optional): Token to treat as NULL (e.g. `"NA"`).
+- `columns` (object, optional): Column-to-type map of schema hints (e.g. `{ "amount": "DECIMAL(12,2)" }`); overrides inference for those columns. Other columns keep inference.
+- `sample_size` (integer, optional, default `20480`): Rows sampled for type inference; `-1` reads the whole file.
 
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `path` | string | • | | CSV file or glob. |
-| `dataset_id` | string | • | | Id to register under. |
-| `header` | boolean | | auto-detect | Whether row 1 holds column names. |
-| `delimiter` | string | | auto-detect | Field delimiter. |
-| `quote` | string | | auto-detect | Quote character (exactly one). |
-| `null_string` | string | | | Token to read as NULL (e.g. `"NA"`). |
-| `columns` | object | | inferred | `{ "amount": "DECIMAL(12,2)" }` type overrides (DuckDB type names). |
-| `sample_size` | integer | | `20480` | Rows sampled for type inference; `-1` reads the whole file. |
+**Returns:** standard envelope; `r.Schema` reflects inferred/declared types, `r.Warnings` notes any coercions.
 
 ```csharp
 engine.Execute("dataframe_load_csv", new Dictionary<string, object?>
 {
-    ["path"] = "data/sales/*.csv", ["dataset_id"] = "sales",
+    ["path"] = "data/sales_*.csv",
+    ["dataset_id"] = "sales",
     ["null_string"] = "NA",
-    ["columns"] = new Dictionary<string, object?> { ["amount"] = "DECIMAL(12,2)" },
+    ["columns"] = new Dictionary<string, object?> { ["amount"] = "DECIMAL(12,2)" }
 });
 ```
 
-### `dataframe_load_json`
+### dataframe_load_parquet
 
-Loads a JSON file (or glob) — newline-delimited JSON (NDJSON) or a top-level array of objects. Schema
-and types are inferred from the values.
+Load a Parquet file, glob, or Hive-partitioned directory. Schema and types come from the file metadata.
 
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `path` | string | • | | JSON file or glob (e.g. `data/*.ndjson`). |
-| `dataset_id` | string | • | | Id to register under. |
-| `format` | string | | `auto` | `auto`, `newline_delimited`, or `array`. |
+**Parameters:**
+- `path` (string, required): File, glob, or directory (e.g. `events/` with `year=/month=` subdirs).
+- `dataset_id` (string, required).
+- `hive_partitioning` (boolean, optional, default: auto-detect): Treat `key=value/` directories as partition columns. When omitted, DuckDB auto-detects the layout from the matched paths; set it explicitly to force the behavior either way.
+- `union_by_name` (boolean, optional, default `false`): Align columns by name across files with differing schemas.
 
-### `dataframe_load_parquet`
+**Returns:** standard envelope; partition keys appear as columns. Partition pruning is applied automatically when a later `filter` constrains a partition key — see [architecture.md](architecture.md#efficiency).
 
-Loads a Parquet file, a glob, or a Hive-partitioned directory glob. Schema and types come from the
-file metadata (no inference). This is the **fastest source** — see [benchmarks](benchmarks.md).
+```csharp
+engine.Execute("dataframe_load_parquet", new Dictionary<string, object?>
+{
+    ["path"] = "warehouse/events/",   // events/year=2025/month=01/*.parquet
+    ["dataset_id"] = "events"
+});
+```
 
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `path` | string | • | | File, glob, or partitioned-dir glob (e.g. `events/**/*.parquet`). |
-| `dataset_id` | string | • | | Id to register under. |
-| `hive_partitioning` | boolean | | auto | Expose `key=value/` dirs as partition columns. |
-| `union_by_name` | boolean | | `false` | Align columns by name across files with differing schemas. |
+### dataframe_load_json
 
-### `dataframe_load_delta`
+Load a JSON file or glob: newline-delimited JSON (NDJSON), a top-level array of objects, or auto-detected. Schema and column types are inferred from the JSON values.
 
-Loads a Delta Lake table. With no version/timestamp it reads the latest snapshot via the DuckDB delta
-extension; supplying `version` or `timestamp` performs **time travel** by replaying the transaction
-log. See [Delta details & limitations](file-formats.md#delta-lake).
+**Parameters:**
+- `path` (string, required): JSON file or glob (e.g. `data/*.ndjson`).
+- `dataset_id` (string, required).
+- `format` (string, optional, default `auto`): `auto` (detect the layout), `newline_delimited` (NDJSON), or `array` (a top-level JSON array of objects).
 
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `path` | string | • | | Delta table root directory. |
-| `dataset_id` | string | • | | Id to register under. |
-| `version` | integer | | latest | Load this snapshot version. Mutually exclusive with `timestamp`. |
-| `timestamp` | string | | latest | Load the latest version at/before this ISO-8601 instant. Mutually exclusive with `version`. |
+**Returns:** standard envelope; nested objects/arrays surface as DuckDB `STRUCT`/`LIST` columns.
+
+```csharp
+engine.Execute("dataframe_load_json", new Dictionary<string, object?>
+{
+    ["path"] = "data/events.ndjson",
+    ["dataset_id"] = "events",
+    ["format"] = "newline_delimited"   // omit for auto-detection
+});
+```
+
+### dataframe_load_delta
+
+Load a Delta Lake table — the latest snapshot, or an earlier one via **time travel**.
+
+> **Latest snapshot** uses the DuckDB `delta` extension, auto-installed/loaded on first use
+> (`INSTALL delta` / `LOAD delta`), which may need network access the first time, or be bundled with
+> the DuckDB build. If it cannot be loaded, the operation returns `BACKEND_ERROR`.
+>
+> **Time travel** (`version` or `timestamp`) does *not* use the extension — the extension's
+> `delta_scan` exposes no version/timestamp parameter. Instead the transaction log (`_delta_log/`) is
+> replayed directly to resolve the data files active at that point, which also means time travel works
+> with no extension or network. This is a happy-path reader: it supports **unpartitioned** tables whose
+> history is plain JSON commits. It returns `BACKEND_ERROR` for checkpointed tables, partition columns,
+> deletion vectors, or other reader features, and for a `version`/`timestamp` the log cannot satisfy.
+> **Checkpoint limitation:** a table that contains a `_last_checkpoint` marker or any
+> `*.checkpoint.parquet` files in `_delta_log/` is not supported for time travel or `append`; both
+> operations require replaying JSON commits from version 0, and checkpoints mean older commits may have
+> been compacted away. Load the latest snapshot (omit `version`/`timestamp`) to read checkpointed tables.
+> `timestamp` resolves to the latest version committed at or before it. Pass at most one of
+> `version`/`timestamp`.
+
+**Parameters:**
+- `path` (string, required): Delta table root.
+- `dataset_id` (string, required).
+- `version` (integer, optional): Load this snapshot version. Mutually exclusive with `timestamp`.
+- `timestamp` (string, optional): ISO-8601 instant; loads the latest version at or before it.
+  Mutually exclusive with `version`.
+
+```csharp
+engine.Execute("dataframe_load_delta", new Dictionary<string, object?>
+{
+    ["path"] = "lake/orders",
+    ["dataset_id"] = "orders",
+    ["version"] = 7              // omit version/timestamp for the latest snapshot
+});
+```
 
 ---
 
 ## Inspection
 
-These read metadata or produce a report; most do **not** register a new dataset (the exceptions are
-`value_counts`, which does, and the report-style ops whose rows land in `preview_rows`).
+### dataframe_schema
 
-### `dataframe_schema`
+Return the schema without scanning data.
 
-Returns the column names, types, and nullability of a dataset **without scanning data**.
+**Parameters:** `dataset_id` (string, required).
 
-| Param | Type | | Notes |
-|-------|------|--|-------|
-| `dataset_id` | string | • | Dataset to describe. |
+**Returns:** `r.Schema` = ordered `ColumnSchema(Name, Type, Nullable)`; `r.RowCount` is `0` if the dataset has not been materialized.
 
-### `dataframe_preview`
+### dataframe_profile
 
-Returns a bounded set of rows: the first (`head`), last (`tail`), or a random `sample`.
+Compute per-column statistics.
 
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `dataset_id` | string | • | | Dataset to preview. |
-| `mode` | string | | `head` | `head`, `tail`, or `sample`. |
-| `limit` | integer | | `50` | Rows to return, `1..1000`. |
-| `seed` | integer | | | **Required when `mode=sample`**; makes sampling repeatable. |
+**Parameters:**
+- `dataset_id` (string, required).
+- `columns` (array, optional): Subset to profile (default: all).
+- `quantiles` (array of numbers, optional, default `[0.25, 0.5, 0.75]`): Quantiles for numeric columns.
 
-### `dataframe_profile`
-
-A `pandas.describe()`-style per-column summary: `null_count`, `distinct_count`, `count` (non-null),
-`min`, `max`, and — for numeric columns — `mean`, `std` (sample), and quantiles. One stats row per
-column lands in `preview_rows`.
-
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `dataset_id` | string | • | | Dataset to profile. |
-| `columns` | array | | all | Subset of columns. |
-| `quantiles` | array | | `[0.25,0.5,0.75]` | Quantiles in `[0,1]` for numeric columns. |
-
-### `dataframe_value_counts`
-
-Counts how often each distinct value of `column` occurs, returning `{ <column>, count, proportion }`
-ordered by count descending (ties broken by value ascending, for determinism). Registers the result.
-
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `dataset_id` | string | • | | Input dataset. |
-| `column` | string | • | | Column to count. |
-| `into` | string | | replaces input | Output id. |
-| `limit` | integer | | all | Keep the top-N most frequent values. |
-| `dropna` | boolean | | `true` | Exclude NULLs (matches pandas). |
-
-### `dataframe_assert`
-
-Evaluates data-quality expectations and returns a per-expectation pass/fail report (it does **not**
-modify or register a dataset). `preview_rows` holds one row per expectation
-(`expectation, column, passed, violations, details`); a warning summarizes any failures so a caller
-can branch on data quality.
-
-| Param | Type | | Notes |
-|-------|------|--|-------|
-| `dataset_id` | string | • | Dataset to check. |
-| `expectations` | array | • | Array of `{ type, ... }` specs (see below). |
-
-Expectation `type` values:
-
-| type | extra fields | passes when |
-|------|--------------|-------------|
-| `not_null` | `column` | no NULLs in the column |
-| `unique` | `column` | all values distinct |
-| `in_range` | `column`, `min?`, `max?` | every value within `[min, max]` |
-| `in_set` | `column`, `values[]` | every value is in the set |
-| `matches` | `column`, `pattern` | every value matches the regex |
-| `row_count` | `min?`, `max?`, `equals?` | the row count satisfies the bound(s) |
+**Returns:** envelope where `r.PreviewRows` holds one row per column — a pandas `describe()`-style summary — with: `null_count`, `distinct_count`, `count` (non-null), `min`, `max`, and, for numeric columns, `mean`, `std` (sample standard deviation), and the requested quantiles. Numeric statistics are serialized round-trippably (see [reliability.md](reliability.md#round-trippable-numeric-serialization)).
 
 ```csharp
-engine.Execute("dataframe_assert", new Dictionary<string, object?>
+var profile = engine.Execute("dataframe_profile", new Dictionary<string, object?>
 {
     ["dataset_id"] = "sales",
-    ["expectations"] = new object[]
-    {
-        new Dictionary<string, object?> { ["type"] = "not_null", ["column"] = "id" },
-        new Dictionary<string, object?> { ["type"] = "in_range", ["column"] = "amount", ["min"] = 0 },
-        new Dictionary<string, object?> { ["type"] = "row_count", ["min"] = 1 },
-    },
+    ["columns"] = new[] { "amount", "quantity" }
 });
 ```
 
-### `dataframe_list`
+### dataframe_value_counts
 
-Lists the datasets registered in the session. `preview_rows` holds one row per dataset
-(`dataset_id, row_count, column_count, source`). The envelope's top-level `dataset_id` is the literal
-`"session"`. Takes no parameters.
+Count how often each distinct value of a column occurs — the categorical-EDA equivalent of pandas `Series.value_counts()`.
 
----
+**Parameters:**
+- `dataset_id` (string, required), `into` (string, optional).
+- `column` (string, required): Column whose value frequencies to count.
+- `limit` (integer, optional): Keep only the top-N most frequent values.
+- `dropna` (boolean, optional, default `true`): Exclude NULL values, matching pandas.
 
-## Projection & row selection
-
-### `dataframe_select`
-
-Projects, renames, and reorders columns. `columns` entries are either a column name (string) or
-`{ column, as }` to rename.
-
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `dataset_id` | string | • | | Input. |
-| `columns` | array | • | | Names or `{ column, as }` objects. |
-| `into` | string | | replaces input | Output id. |
+**Returns:** envelope for the new dataset registered under `into` (or replacing `dataset_id`), with columns `<column>`, `count`, and `proportion` (the value's share of the counted rows), ordered by `count` descending and the value ascending (a deterministic total order).
 
 ```csharp
-["columns"] = new object[]
+var counts = engine.Execute("dataframe_value_counts", new Dictionary<string, object?>
 {
-    "id",
-    new Dictionary<string, object?> { ["column"] = "amount", ["as"] = "amount_usd" },
-}
+    ["dataset_id"] = "sales",
+    ["into"] = "region_counts",
+    ["column"] = "region",
+    ["limit"] = 10
+});
 ```
 
-### `dataframe_filter`
+### dataframe_assert
 
-Selects rows matching a structured [predicate tree](#predicate-trees) — never SQL text.
+Evaluate data-quality expectations against a dataset and return a per-expectation pass/fail report — a first-class equivalent of pandera / Great Expectations checks. It does not modify or register a dataset.
 
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `dataset_id` | string | • | | Input. |
-| `predicate` | object | • | | A predicate tree (see [grammar](#predicate-trees)). |
-| `into` | string | | replaces input | Output id. |
+**Parameters:**
+- `dataset_id` (string, required).
+- `expectations` (array, required): One or more `{ "type", ... }` specs:
+  - `not_null` — `{ type, column }`: the column has no NULLs.
+  - `unique` — `{ type, column }`: no value occurs more than once.
+  - `in_range` — `{ type, column, min?, max? }`: non-null values fall within the (inclusive) bounds; at least one of `min`/`max`.
+  - `in_set` — `{ type, column, values }`: non-null values are drawn from `values`.
+  - `matches` — `{ type, column, pattern }`: non-null values match the regular expression.
+  - `row_count` — `{ type, equals?, min?, max? }`: the row count satisfies the bounds; at least one of `equals`/`min`/`max`.
 
-### `dataframe_with_column`
-
-Adds or replaces a single column computed from a structured [expression tree](#expression-trees) —
-never SQL text.
-
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `dataset_id` | string | • | | Input. |
-| `name` | string | • | | New or replaced column name. |
-| `expression` | object | • | | An expression tree (see [grammar](#expression-trees)). |
-| `into` | string | | replaces input | Output id. |
-
-### `dataframe_rename`
-
-Renames one or more columns; unmentioned columns are kept and order is preserved. **Requires `into`.**
-
-| Param | Type | | Notes |
-|-------|------|--|-------|
-| `dataset_id` | string | • | Input. |
-| `into` | string | • | Output id. |
-| `columns` | object | • | Map of old name → new name. |
-
----
-
-## Aggregation & analytics
-
-### `dataframe_group_by`
-
-Groups by zero or more columns and computes aggregates. `group_by` may be empty for a grand total.
-Each aggregation is `{ column, function, alias, q?, column2? }`. Use column `"*"` with `count` for a
-row count. An optional `having` [predicate tree](#predicate-trees) filters the aggregated result; its
-columns must be group keys or declared aggregate aliases.
-
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `dataset_id` | string | • | | Input. |
-| `group_by` | array | • | | Grouping columns (may be empty). |
-| `aggregations` | array | • | | Aggregate specs (see [functions](#aggregation-functions)). |
-| `into` | string | | replaces input | Output id. |
-| `having` | object | | | Predicate tree over the aggregated rows. |
+**Returns:** the standard envelope where `r.PreviewRows` holds one row per expectation: `expectation`, `column`, `passed` (boolean), `violations` (count), and `details`. When any expectation fails, a `r.Warnings` entry summarizes how many — so a caller can branch on data quality without parsing each row.
 
 ```csharp
-["group_by"] = new[] { "region", "category" },
-["aggregations"] = new object[]
+var report = engine.Execute("dataframe_assert", new Dictionary<string, object?>
 {
-    new Dictionary<string, object?> { ["column"] = "amount", ["function"] = "sum", ["alias"] = "total" },
-    new Dictionary<string, object?> { ["column"] = "amount", ["function"] = "quantile", ["q"] = 0.95, ["alias"] = "p95" },
-    new Dictionary<string, object?> { ["column"] = "*", ["function"] = "count", ["alias"] = "n" },
-},
+    ["dataset_id"] = "orders",
+    ["expectations"] = new object[]
+    {
+        new Dictionary<string, object?> { ["type"] = "not_null", ["column"] = "order_id" },
+        new Dictionary<string, object?> { ["type"] = "unique", ["column"] = "order_id" },
+        new Dictionary<string, object?> { ["type"] = "in_range", ["column"] = "amount", ["min"] = 0 },
+        new Dictionary<string, object?> { ["type"] = "row_count", ["min"] = 1 }
+    }
+});
+
+if (report.Success && report.Warnings.Count > 0)
+    Console.WriteLine($"data-quality issues: {string.Join("; ", report.Warnings)}");
 ```
 
-### `dataframe_window`
+### dataframe_preview
 
-Adds window-function columns **without collapsing rows**. `functions` is an array of
-`{ function, column?, alias, args? }`; `partition_by` and `order_by` (`{ column, direction, nulls }`)
-define the window, with an optional `frame`.
+Return a bounded set of rows.
 
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `dataset_id` | string | • | | Input. |
-| `functions` | array | • | | Window-function specs (see [functions](#window-functions)). |
-| `into` | string | | replaces input | Output id. |
-| `partition_by` | array | | none | Partition columns. |
-| `order_by` | array | | none | `{ column, direction (asc\|desc), nulls (first\|last) }`. |
-| `frame` | object | | | `{ start, end }`; each bound is `unbounded_preceding` / `current_row` / `unbounded_following` or `{ preceding: N }` / `{ following: N }`. |
+**Parameters:**
+- `dataset_id` (string, required).
+- `mode` (string, optional, default `head`): one of `head`, `tail`, `sample`.
+- `limit` (integer, optional, default `50`, max `1000`): Number of rows.
+- `seed` (integer, **required when `mode = sample`**): Makes sampling deterministic. A `sample` request without a `seed` is rejected with `INVALID_ARGUMENT` rather than returning unstable rows (see [reliability.md](reliability.md#determinism)). Ignored for `head`/`tail`.
+
+The rows are returned in `r.PreviewRows`; `r.PreviewTruncated` indicates whether the dataset holds more rows than were returned.
+
+---
+
+## Transformation
+
+### dataframe_select
+
+Project, rename, and reorder columns.
+
+**Parameters:**
+- `dataset_id` (string, required), `into` (string, optional).
+- `columns` (array, required): Each entry is either a column name (string) or `{ "column", "as" }` to rename.
 
 ```csharp
-["functions"] = new object[]
+engine.Execute("dataframe_select", new Dictionary<string, object?>
 {
-    new Dictionary<string, object?> { ["function"] = "rank", ["alias"] = "rnk" },
-    new Dictionary<string, object?> { ["function"] = "sum", ["column"] = "amount", ["alias"] = "running_total" },
-},
-["partition_by"] = new[] { "region" },
-["order_by"] = new object[] { new Dictionary<string, object?> { ["column"] = "ts", ["direction"] = "asc" } },
-["frame"] = new Dictionary<string, object?> { ["start"] = "unbounded_preceding", ["end"] = "current_row" },
+    ["dataset_id"] = "sales",
+    ["into"] = "sales_slim",
+    ["columns"] = new object[]
+    {
+        "region",
+        new Dictionary<string, object?> { ["column"] = "amount", ["as"] = "revenue" }
+    }
+});
+```
+
+### dataframe_rename
+
+Rename one or more columns while keeping all other columns unchanged.
+
+**Parameters:**
+- `dataset_id` (string, required), `into` (string, required).
+- `columns` (object, required): map of old column name → new column name.
+
+Preserves column order. Two old columns may not be renamed to the same new name, and every old name must exist in the source schema.
+
+```csharp
+engine.Execute("dataframe_rename", new Dictionary<string, object?>
+{
+    ["dataset_id"] = "sales",
+    ["into"] = "sales_renamed",
+    ["columns"] = new Dictionary<string, object?>
+    {
+        ["amount"] = "revenue",
+        ["region"] = "territory"
+    }
+});
+```
+
+### dataframe_filter
+
+Select rows matching a [predicate tree](#predicate-trees).
+
+**Parameters:**
+- `dataset_id` (string, required), `into` (string, optional).
+- `predicate` (object, required): A predicate tree.
+
+```csharp
+engine.Execute("dataframe_filter", new Dictionary<string, object?>
+{
+    ["dataset_id"] = "sales",
+    ["predicate"] = new Dictionary<string, object?>
+    {
+        ["op"] = "and",
+        ["conditions"] = new object[]
+        {
+            new Dictionary<string, object?> { ["column"]="status", ["op"]="eq", ["value"]="completed" },
+            new Dictionary<string, object?> { ["column"]="amount", ["op"]="gte", ["value"]=100 }
+        }
+    }
+});
+```
+
+### dataframe_with_column
+
+Add or replace a column computed from an [expression tree](#expression-trees).
+
+**Parameters:**
+- `dataset_id` (string, required), `into` (string, optional).
+- `name` (string, required): New/replaced column name.
+- `expression` (object, required): An expression tree.
+
+```csharp
+engine.Execute("dataframe_with_column", new Dictionary<string, object?>
+{
+    ["dataset_id"] = "sales",
+    ["name"] = "net",
+    ["expression"] = new Dictionary<string, object?>
+    {
+        ["op"] = "subtract",
+        ["args"] = new object[]
+        {
+            new Dictionary<string, object?> { ["column"] = "amount" },
+            new Dictionary<string, object?> { ["column"] = "discount" }
+        }
+    }
+});
+```
+
+### dataframe_fillna
+
+Replace NULL values — in **scalar mode** with a constant and/or per-column replacements, or in **carry mode** by forward/backward-filling along an ordering (the pandas `ffill`/`bfill` equivalent).
+
+**Parameters:**
+- `dataset_id` (string, required), `into` (string, optional).
+- `value` (string, optional): Scalar-mode global replacement value. Coerced to each column's type.
+- `values` (object, optional): Scalar-mode `{ column: replacement }` map overriding `value` for those columns.
+- `method` (string, optional): Carry mode — `ffill` (carry the last non-null value forward) or `bfill` (carry the next non-null value backward). Requires `order_by`. Cannot be combined with `value`/`values`.
+- `order_by` (array, optional): Ordering column(s) that define previous/next for `method` (required when `method` is set).
+- `partition_by` (array, optional): Carry-mode grouping columns; the fill restarts within each group.
+- `columns` (array, optional): Carry-mode subset of columns to fill (default: all columns).
+- In scalar mode, at least one of `value` or `values` must be provided.
+
+```csharp
+// Scalar mode
+engine.Execute("dataframe_fillna", new Dictionary<string, object?>
+{
+    ["dataset_id"] = "sales",
+    ["into"] = "sales_filled",
+    ["value"] = "0",
+    ["values"] = new Dictionary<string, object?> { ["region"] = "Unknown" }
+});
+
+// Carry mode (forward-fill a time series per sensor)
+engine.Execute("dataframe_fillna", new Dictionary<string, object?>
+{
+    ["dataset_id"] = "readings",
+    ["into"] = "readings_filled",
+    ["method"] = "ffill",
+    ["order_by"] = new[] { "ts" },
+    ["partition_by"] = new[] { "sensor_id" }
+});
+```
+
+### dataframe_dropna
+
+Remove rows containing NULL values.
+
+**Parameters:**
+- `dataset_id` (string, required), `into` (string, optional).
+- `columns` (array, optional): Columns to check (default: all columns).
+- `how` (string, optional, default `any`): `any` drops rows with any NULL in the checked columns; `all` drops rows where all checked columns are NULL.
+
+```csharp
+engine.Execute("dataframe_dropna", new Dictionary<string, object?>
+{
+    ["dataset_id"] = "sales",
+    ["into"] = "sales_clean",
+    ["columns"] = new[] { "amount", "region" },
+    ["how"] = "any"
+});
+```
+
+### dataframe_join
+
+Join two datasets on one or more keys.
+
+**Parameters:**
+- `left` (string, required): Left dataset id.
+- `right` (string, required): Right dataset id.
+- `into` (string, required): Output dataset id.
+- `how` (string, optional, default `inner`): one of `inner`, `left`, `right`, `full`, `semi`, `anti`, `cross`, `asof`.
+- `on` (array, optional): Key column names present in both sides.
+- `left_on` / `right_on` (arrays, optional): Use when key names differ; must be equal length.
+- `asof_op` (string, optional, default `>=`): Inequality direction for `asof` joins (`>=` or `<=`). The last key is the as-of (inequality) column; any preceding keys are equality match columns.
+- `suffix` (string, optional, default `_right`): Suffix for overlapping non-key columns.
+
+```csharp
+engine.Execute("dataframe_join", new Dictionary<string, object?>
+{
+    ["left"] = "orders",
+    ["right"] = "customers",
+    ["into"] = "orders_enriched",
+    ["how"] = "left",
+    ["on"] = new[] { "customer_id" }
+});
+```
+
+### dataframe_group_by
+
+Group rows and compute aggregates.
+
+**Parameters:**
+- `dataset_id` (string, required), `into` (string, optional).
+- `group_by` (array, required): Grouping column names. May be empty `[]` for a grand total.
+- `aggregations` (array, required): Each `{ "column", "function", "alias", "q"?, "column2"? }`.
+  - `function` ∈ `count`, `count_distinct`, `approx_count_distinct`, `sum`, `product`, `avg`, `min`, `max`, `median`, `mode`, `stddev`, `stddev_pop`, `stddev_samp`, `var`, `var_pop`, `var_samp`, `bool_and`, `bool_or`, `first`, `last`, `list`, `quantile`, `approx_quantile`, `corr`, `covar`, `arg_min`, `arg_max`.
+  - For `count` over all rows, use `column: "*"`.
+  - `stddev`/`var` are the sample variants (aliases of `stddev_samp`/`var_samp`); use the explicit `_pop`/`_samp` forms when the distinction matters. `bool_and`/`bool_or` reduce a boolean column. `approx_count_distinct` (HyperLogLog) is a fast cardinality estimate.
+  - `quantile` and `approx_quantile` require `q` in `[0, 1]`; they render as `quantile_cont(column, q)` and `approx_quantile(column, q)` (the latter trades exactness for speed on large inputs).
+  - `corr` and `covar` require `column2`; they render as `corr(column, column2)` and `covar_samp(column, column2)`.
+  - `arg_min` and `arg_max` require `column2`: they return `column`'s value in the row where `column2` is minimal / maximal (e.g. the product with the highest revenue).
+- `having` (object, optional): A [predicate tree](#predicate-trees) applied to the aggregated result, equivalent to SQL `HAVING`. Columns referenced in `having` must be either `group_by` keys or aggregate `alias`es; otherwise the operation returns `INVALID_PREDICATE`.
+
+```csharp
+engine.Execute("dataframe_group_by", new Dictionary<string, object?>
+{
+    ["dataset_id"] = "sales",
+    ["group_by"] = new[] { "region", "category" },
+    ["aggregations"] = new object[]
+    {
+        new Dictionary<string, object?> { ["column"]="amount", ["function"]="sum", ["alias"]="revenue" },
+        new Dictionary<string, object?> { ["column"]="*",      ["function"]="count", ["alias"]="orders" },
+        new Dictionary<string, object?> { ["column"]="amount", ["function"]="quantile", ["q"]=0.95, ["alias"]="p95" },
+        new Dictionary<string, object?> { ["column"]="x", ["function"]="corr", ["column2"]="y", ["alias"]="corr_xy" }
+    },
+    ["having"] = new Dictionary<string, object?> { ["column"]="revenue", ["op"]="gt", ["value"]=100 }
+});
+```
+
+### dataframe_window
+
+Apply window functions without collapsing rows.
+
+**Parameters:**
+- `dataset_id` (string, required), `into` (string, optional).
+- `functions` (array, required): Each `{ "function", "column"?, "alias", "args"? }`.
+  - `function` ∈ `row_number`, `rank`, `dense_rank`, `percent_rank`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `sum`, `avg`, `min`, `max`, `count`.
+  - Rank functions (`row_number`, `rank`, `dense_rank`, `percent_rank`) ignore `column`.
+  - `ntile` requires `args: [N]` (number of buckets); it ignores `column`.
+  - `lag`/`lead` use `args: [offset]` (default 1).
+  - `first_value`/`last_value` and aggregate window functions require `column`.
+- `partition_by` (array, optional): Partition columns.
+- `order_by` (array, optional): `{ "column", "direction", "nulls" }` entries.
+  - `direction` ∈ `asc`, `desc` (default `asc`).
+  - `nulls` ∈ `first`, `last`. When omitted, DuckDB's default null ordering applies.
+- `frame` (object, optional): `{ "start", "end" }` for running/rolling aggregates. Each bound may be a string token (`unbounded_preceding`, `current_row`, `unbounded_following`) or a numeric offset object (`{ "preceding": N }`, `{ "following": N }`).
+
+```csharp
+engine.Execute("dataframe_window", new Dictionary<string, object?>
+{
+    ["dataset_id"] = "sales",
+    ["functions"] = new object[]
+    {
+        new Dictionary<string, object?> { ["function"]="rank", ["alias"]="rank_in_region" },
+        new Dictionary<string, object?> { ["function"]="ntile", ["args"]=new object[] { 4 }, ["alias"]="quartile" },
+        new Dictionary<string, object?> { ["function"]="sum", ["column"]="amount", ["alias"]="rolling_sum" }
+    },
+    ["partition_by"] = new[] { "region" },
+    ["order_by"] = new object[]
+    {
+        new Dictionary<string, object?> { ["column"]="amount", ["direction"]="desc" }
+    },
+    ["frame"] = new Dictionary<string, object?> { ["start"]="unbounded_preceding", ["end"]="current_row" }
+});
+```
+
+### dataframe_pivot
+
+Reshape long → wide.
+
+**Parameters:**
+- `dataset_id` (string, required), `into` (string, optional).
+- `index` (array, required): Columns that remain rows.
+- `columns` (string, required): Column whose distinct values become new columns.
+- `values` (string, required): Column to aggregate into the new cells. May also be an array of
+  `{ column, aggregation, alias? }` objects to compute multiple measures at once.
+- `aggregation` (string, optional, default `sum`): Aggregate used with scalar `values`
+  (`sum`, `avg`, `min`, `max`, `count`). Ignored when `values` is an array.
+
+```csharp
+engine.Execute("dataframe_pivot", new Dictionary<string, object?>
+{
+    ["dataset_id"] = "sales",
+    ["index"] = new[] { "region" },
+    ["columns"] = "month",
+    ["values"] = new[]
+    {
+        new Dictionary<string, object?> { ["column"] = "amount", ["aggregation"] = "sum", ["alias"] = "total" },
+        new Dictionary<string, object?> { ["column"] = "amount", ["aggregation"] = "avg", ["alias"] = "avg_amt" }
+    }
+});
+```
+
+### dataframe_unpivot
+
+Reshape wide → long. `id_columns` stay as rows; `value_columns` are stacked into `{name_to, value_to}` pairs.
+
+**Parameters:**
+- `dataset_id` (string, required), `into` (string, optional).
+- `id_columns` (array, required): Columns to keep as row identifiers (may be empty `[]`).
+- `value_columns` (array, required): Columns to unpivot.
+- `name_to` (string, optional, default `name`): Output column for the former value-column name.
+- `value_to` (string, optional, default `value`): Output column for the value.
+
+```csharp
+engine.Execute("dataframe_unpivot", new Dictionary<string, object?>
+{
+    ["dataset_id"] = "sales",
+    ["id_columns"] = new[] { "region" },
+    ["value_columns"] = new[] { "Q1", "Q2", "Q3", "Q4" },
+    ["name_to"] = "quarter",
+    ["value_to"] = "revenue"
+});
+```
+
+### dataframe_unnest
+
+Explode a LIST column into one row per element. Other columns are replicated for each element.
+
+**Parameters:**
+- `dataset_id` (string, required), `into` (string, optional).
+- `column` (string, required): LIST column to explode.
+
+```csharp
+engine.Execute("dataframe_unnest", new Dictionary<string, object?>
+{
+    ["dataset_id"] = "orders",
+    ["column"] = "items"
+});
+```
+
+### dataframe_sort
+
+Order rows deterministically.
+
+**Parameters:**
+- `dataset_id` (string, required), `into` (string, optional).
+- `by` (array, required): `{ "column", "direction", "nulls" }` entries.
+  - `direction` ∈ `asc`, `desc` (default `asc`).
+  - `nulls` ∈ `first`, `last` (default `last`).
+- `limit` (integer, optional, `>= 1`): Keep only the first N rows after sorting (top-N).
+
+Ties are broken by the order of `by` keys; the result ordering is fully specified and stable — see [reliability.md](reliability.md#explicit-ordering-type-and-null-handling).
+
+### dataframe_distinct
+
+Remove duplicate rows.
+
+**Parameters:**
+- `dataset_id` (string, required), `into` (string, optional).
+- `columns` (array, optional): Columns to dedupe on (default: all columns).
+- `keep` (string, optional, default `first`): `first` or `last` — which row within each duplicate
+  group survives under the supplied `order_by`. `first` keeps the earliest row in that ordering;
+  `last` keeps the latest. Requires `order_by` to be meaningful.
+- `order_by` (array, optional): Array of `{ column, direction }` defining the ordering within each
+  duplicate group; `keep` then selects the first or last row in that ordering. For example,
+  `direction: asc` with `keep: last` keeps the row with the largest value of that column.
+
+> **Note on `keep` and ordering direction.** `keep` selects which row in the stated `order_by` order
+> survives; it does not change the meaning of your `direction`. Internally `keep=last` flips the scan
+> direction of each `order_by` key so the underlying `DISTINCT ON` retains the last row of the group —
+> this is an implementation detail. The directions you pass always describe the logical ordering, not
+> the scan order, so `direction: asc` + `keep: last` always means "keep the largest".
+
+### dataframe_union
+
+Concatenate two or more schema-compatible datasets.
+
+**Parameters:**
+- `datasets` (array of strings, required): Dataset ids to concatenate, in order.
+- `into` (string, required).
+- `by_name` (boolean, optional, default `false`): Align columns by name rather than position.
+- `distinct` (boolean, optional, default `false`): Drop duplicate rows across the union.
+- `explain` (boolean, optional, default `false`): Include the DuckDB query plan in `r.Stats.Plan`.
+
+### dataframe_sample
+
+Materialize a deterministic reservoir sample of a dataset.
+
+**Parameters:**
+- `dataset_id` (string, required), `into` (string, optional).
+- `n` (integer, required): Maximum rows to keep (>= 1).
+- `seed` (integer, required): Deterministic seed for repeatable sampling.
+
+```csharp
+engine.Execute("dataframe_sample", new Dictionary<string, object?>
+{
+    ["dataset_id"] = "events",
+    ["n"] = 1000,
+    ["seed"] = 42
+});
 ```
 
 ---
 
-## Reshaping
+## Output & Management
 
-### `dataframe_pivot`
+### dataframe_export
 
-Long → wide. `index` columns remain rows; the distinct values of the `columns` column become new
-columns. `values` is either a single column name with `aggregation` (default `sum`), or an array of
-`{ column, aggregation, alias? }`.
+Write a dataset to disk. The only operation that writes files. When the operation (or the engine) is
+constructed with an `IPathPolicy`, the target path must be permitted by that policy, otherwise the
+operation returns `PERMISSION_DENIED` (see [security.md](security.md)).
 
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `dataset_id` | string | • | | Input. |
-| `index` | array | • | | Columns that remain rows. |
-| `columns` | string | • | | Column whose distinct values become new columns. |
-| `values` | string/array | • | | A column name, or `{ column, aggregation, alias? }` objects. |
-| `into` | string | | replaces input | Output id. |
-| `aggregation` | string | | `sum` | `sum`/`avg`/`min`/`max`/`count`; scalar-`values` form only. |
+**Parameters:**
+- `dataset_id` (string, required).
+- `path` (string, required): Output file or directory.
+- `format` (string, required): `csv`, `parquet`, `json`, or `delta`. `delta` writes a Delta table
+  (Parquet data files plus a hand-written `_delta_log/`); the DuckDB `delta` extension is
+  read-only, so writes are done without it.
+- `mode` (string, optional, default `error`): `error` (fail if target exists), `append` (Delta only;
+  add a new commit to an existing table), or `overwrite` (replace the target atomically).
+- `partition_by` (array, optional): Partition columns (Parquet and Delta).
+- `compression` (string, optional): e.g. `snappy`, `zstd` for Parquet or JSON.
+- `header` (boolean, optional, default `true`): Write a header row (CSV only).
+- `delimiter` (string, optional, default `,`): Field delimiter — exactly one character (CSV only).
+- `quote` (string, optional, default `"`): Quote character — exactly one character (CSV only).
+- `escape` (string, optional, default `"`): Escape character — exactly one character (CSV only).
+- `array` (boolean, optional, default `false`): JSON only. When `false` the output is
+  newline-delimited JSON (NDJSON); when `true` the output is a single top-level JSON array of
+  objects.
 
-### `dataframe_unpivot`
+CSV options are rejected for `parquet`, `json`, and `delta` formats with `INVALID_ARGUMENT`, and each
+`delimiter`/`quote`/`escape` value must be exactly one character. `array` is rejected for non-JSON
+formats. When the target exists and `mode` is not `overwrite` (nor `append` for Delta), the operation
+returns `TARGET_EXISTS`.
 
-Wide → long. `id_columns` are kept as row identifiers; `value_columns` are stacked into a name column
-(`name_to`, default `name`) and a value column (`value_to`, default `value`).
+> **Delta concurrency.** Concurrent `append` exports to the same Delta table path are serialized per
+> path, so `_delta_log/` commits are emitted sequentially and concurrent writers cannot corrupt the
+> transaction log. Appends to different Delta tables do not block each other. This locking is
+> process-scoped; separate processes still require external coordination.
 
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `dataset_id` | string | • | | Input. |
-| `id_columns` | array | • | | Kept as identifiers (may be empty). |
-| `value_columns` | array | • | | Columns to stack into rows. |
-| `into` | string | | replaces input | Output id. |
-| `name_to` | string | | `name` | Output name column. |
-| `value_to` | string | | `value` | Output value column. |
+```csharp
+var r = engine.Execute("dataframe_export", new Dictionary<string, object?>
+{
+    ["dataset_id"] = "orders_enriched",
+    ["path"] = "out/orders/",
+    ["format"] = "parquet",
+    ["partition_by"] = new[] { "region" },
+    ["compression"] = "zstd"
+});
+if (!r.Success) Console.WriteLine($"[{r.ErrorCode}] {r.Message}");
+```
 
-### `dataframe_unnest`
+### dataframe_list
 
-Explodes a `LIST` column so each element becomes its own row; other columns are replicated.
+List datasets registered in the current session.
 
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `dataset_id` | string | • | | Input. |
-| `column` | string | • | | LIST column to explode. |
-| `into` | string | | replaces input | Output id. |
+**Parameters:** none.
 
----
+**Returns:** envelope where `r.PreviewRows` holds `{ "dataset_id", "row_count", "column_count", "source" }` per dataset. The envelope's `r.DatasetId` is the literal `session` — this overview refers to the whole session, not a single dataset.
 
-## Combining
+### dataframe_drop
 
-### `dataframe_join`
+Release a dataset and free its resources.
 
-Joins two datasets into `into`. **Requires `into`.** Provide `on` (keys in both sides) or
-`left_on`/`right_on` (equal length). For `asof`, the last key is the inequality column and any
-preceding keys are equality matches.
-
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `left` | string | • | | Left dataset id. |
-| `right` | string | • | | Right dataset id. |
-| `into` | string | • | | Output id. |
-| `how` | string | | `inner` | `inner`/`left`/`right`/`full`/`semi`/`anti`/`cross`/`asof`. |
-| `on` | array | | | Key columns present in both sides. |
-| `left_on` / `right_on` | array | | | Equal-length key lists (alternative to `on`). |
-| `asof_op` | string | | `>=` | `>=` or `<=`; the as-of inequality when `how=asof`. |
-| `suffix` | string | | `_right` | Suffix for overlapping non-key right columns. |
-
-### `dataframe_union`
-
-Concatenates two or more datasets into `into`. **Requires `into`.**
-
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `datasets` | array | • | | Ordered ids to concatenate (≥ 2). |
-| `into` | string | • | | Output id. |
-| `by_name` | boolean | | `false` | Align columns by name (else by position). |
-| `distinct` | boolean | | `false` | Drop duplicate rows across the union. |
-
----
-
-## Ordering, sampling & dedup
-
-### `dataframe_sort`
-
-Orders rows by one or more keys; ties break by key order. Optional `limit` keeps the first N (top-N).
-
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `dataset_id` | string | • | | Input. |
-| `by` | array | • | | `{ column, direction (asc\|desc), nulls (first\|last) }`. |
-| `into` | string | | replaces input | Output id. |
-| `limit` | integer | | all | Keep the first N rows after sorting. |
-
-### `dataframe_sample`
-
-Materializes a deterministic **reservoir sample**. Both `n` and `seed` are required; `seed` makes the
-sample repeatable.
-
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `dataset_id` | string | • | | Input. |
-| `n` | integer | • | | Reservoir size (≥ 1). |
-| `seed` | integer | • | | Deterministic seed. |
-| `into` | string | | replaces input | Output id. |
-
-### `dataframe_distinct`
-
-Removes duplicate rows. With no `columns`, dedupes whole rows. With `columns`, keeps one row per
-distinct combination; `keep` (`first`/`last`) plus `order_by` decide which survives.
-
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `dataset_id` | string | • | | Input. |
-| `into` | string | | replaces input | Output id. |
-| `columns` | array | | all | Columns to dedupe on. |
-| `keep` | string | | `first` | `first`/`last` within each group, under `order_by`. |
-| `order_by` | array | | | `{ column, direction (asc\|desc) }` defining the within-group order. |
-
----
-
-## Missing data
-
-### `dataframe_fillna`
-
-Replaces NULLs. **Scalar mode:** provide a global `value` and/or a per-column `values` map (at least
-one). **Carry mode:** set `method` to `ffill`/`bfill` along an `order_by` ordering, optionally within
-`partition_by` groups (the pandas ffill/bfill equivalent). `method` cannot combine with
-`value`/`values`.
-
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `dataset_id` | string | • | | Input. |
-| `into` | string | | replaces input | Output id. |
-| `value` | string | | | Scalar mode: global replacement, coerced to each column's type. |
-| `values` | object | | | Scalar mode: per-column overrides. |
-| `method` | string | | | Carry mode: `ffill` or `bfill` (requires `order_by`). |
-| `order_by` | array | | | Ordering for `method`. |
-| `partition_by` | array | | | Carry-mode groups; the fill restarts per group. |
-| `columns` | array | | all | Carry-mode subset to fill. |
-
-### `dataframe_dropna`
-
-Removes rows with NULLs. `columns` restricts the check; `how` drops when `any` (default) or `all` of
-the checked columns are NULL.
-
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `dataset_id` | string | • | | Input. |
-| `into` | string | | replaces input | Output id. |
-| `columns` | array | | all | Columns to check. |
-| `how` | string | | `any` | `any` or `all`. |
-
----
-
-## Output & lifecycle
-
-### `dataframe_export`
-
-Writes a dataset to disk. **`mode=error`** fails if the target exists; **`overwrite`** replaces it
-atomically; **`append`** adds a commit (Delta only). Honors the [path policy](concepts.md#path-policy)
-for writes. Format-specific options are in [file-formats.md](file-formats.md).
-
-| Param | Type | | Default | Notes |
-|-------|------|--|---------|-------|
-| `dataset_id` | string | • | | Dataset to export. |
-| `path` | string | • | | Output file or directory. |
-| `format` | string | • | | `csv`, `parquet`, `json`, or `delta`. |
-| `mode` | string | | `error` | `error`, `append` (Delta), or `overwrite`. |
-| `partition_by` | array | | | Partition columns (Parquet and Delta). |
-| `compression` | string | | | Codec, e.g. `snappy`, `zstd`, `gzip` (Parquet/JSON). |
-| `array` | boolean | | `false` | JSON: write a top-level array (else NDJSON). |
-| `header` | boolean | | `true` | CSV: write a header row. |
-| `delimiter` | string | | `,` | CSV field delimiter. |
-| `quote` | string | | `"` | CSV quote character. |
-| `escape` | string | | `"` | CSV escape character. |
-
-### `dataframe_drop`
-
-Releases a dataset; its backend resources are freed once no remaining dataset depends on them.
-
-| Param | Type | | Notes |
-|-------|------|--|-------|
-| `dataset_id` | string | • | Dataset to release. |
+**Parameters:** `dataset_id` (string, required).
 
 ---
 
 ## Predicate trees
 
-The structured predicate language used by `dataframe_filter` and the `having` clause of
-`dataframe_group_by`. It is an **enumerated, closed vocabulary** — there is no path from input to
-executed SQL (see [no injection surface](concepts.md#no-injection-surface)). Parsed by
-[`PredicateParser`](../src/Andy.Data.Abstractions/Predicates/PredicateParser.cs); malformed input
-returns `INVALID_PREDICATE`.
+`dataframe_filter` takes a tree of **condition** and **logical** nodes. No strings are concatenated into a query — the vocabulary is enumerated and validated. (The model behind this grammar is `PredicateNode` / `PredicateParser` in the `Andy.Data.Predicates` namespace.)
 
-A node is either a **condition** (has a `column`) or a **logical** node (has an `op` but no `column`).
+**Condition node:**
+```json
+{ "column": "amount", "op": "gte", "value": 100 }
+```
 
-**Condition node** — `{ "column", "op", <operand> }`:
+Comparison ops: `eq`, `neq`, `gt`, `gte`, `lt`, `lte`.
+Set/range ops: `in` (`"values": [...]`), `between` (`"low"`, `"high"`).
+Null ops: `is_null`, `is_not_null` (no `value`).
+Text ops: `like`, `ilike`, `starts_with`, `ends_with`, `contains`, `matches` (`value` is the pattern/substring; `matches` uses regular expressions).
 
-| `op` | operand | meaning |
-|------|---------|---------|
-| `eq` `neq` `gt` `gte` `lt` `lte` | `value` *or* `value_column` | comparison against a literal or another column |
-| `in` | `values: [...]` (non-empty) | membership |
-| `between` | `low`, `high` | inclusive range |
-| `is_null` `is_not_null` | — | null test |
-| `like` `ilike` | `value` | SQL `LIKE` / case-insensitive `LIKE` |
-| `starts_with` `ends_with` `contains` | `value` | substring tests |
-| `matches` | `value` | regular-expression match |
+A condition can compare two columns by using `value_column` instead of `value`:
+```json
+{ "column": "updated_at", "op": "gt", "value_column": "created_at" }
+```
 
-Comparison and text operators take **either** a `value` (literal) **or** a `value_column` (compare to
-another column), not both.
+**Logical node:**
+```json
+{ "op": "and", "conditions": [ <node>, <node>, ... ] }
+```
+Logical ops: `and`, `or` (n-ary), `not` (single `condition`).
 
-**Logical nodes:**
-
-- `{ "op": "and"|"or", "conditions": [ <node>, ... ] }` — n-ary (one or more children).
-- `{ "op": "not", "condition": <node> }` — negation of one child.
-
-```jsonc
+Nodes nest arbitrarily:
+```json
 {
   "op": "and",
   "conditions": [
-    { "column": "amount", "op": "between", "low": 100, "high": 1000 },
+    { "column": "status", "op": "eq", "value": "completed" },
     { "op": "or", "conditions": [
-      { "column": "region", "op": "in", "values": ["EU", "US"] },
-      { "column": "vip", "op": "eq", "value": true }
-    ]},
-    { "op": "not", "condition": { "column": "status", "op": "eq", "value": "void" } }
+      { "column": "region", "op": "in", "values": ["EMEA", "APAC"] },
+      { "column": "amount", "op": "gt", "value": 1000 }
+    ]}
   ]
-}
-```
-
-In C#, build the tree with nested `Dictionary<string, object?>` and `object[]`:
-
-```csharp
-["predicate"] = new Dictionary<string, object?>
-{
-    ["op"] = "and",
-    ["conditions"] = new object[]
-    {
-        new Dictionary<string, object?> { ["column"] = "amount", ["op"] = "gte", ["value"] = 100 },
-        new Dictionary<string, object?> { ["column"] = "region", ["op"] = "in", ["values"] = new[] { "EU", "US" } },
-    },
 }
 ```
 
 ## Expression trees
 
-The structured expression language used by `dataframe_with_column`. Closed vocabulary, parsed by
-[`ExpressionParser`](../src/Andy.Data.Abstractions/Expressions/ExpressionParser.cs); malformed input
-returns `INVALID_PREDICATE`.
+`dataframe_with_column` takes an expression tree of **leaves** (`{ "column": "x" }` or `{ "literal": 42 }`) and **operator nodes** (`{ "op": "...", "args": [ ... ] }`). (The model behind this grammar is `ExprNode` / `ExpressionParser` in the `Andy.Data.Expressions` namespace.)
 
-**Leaves:**
+Arithmetic: `add`, `subtract`, `multiply`, `divide`, `modulo`, `round`, `abs`, `floor`, `ceil`, `power`, `ln`.
+String: `concat`, `upper`, `lower`, `trim`, `substring`, `length`, `replace`, `split_part`, `lpad`, `rpad`, `regexp_replace`, `regexp_extract`, `regexp_matches`.
+Conditional: `coalesce`, `nullif`, `greatest`, `least`, `clip`, `case`. (`clip(x, lo, hi)` bounds `x` into `[lo, hi]`; `greatest`/`least` take two or more args.)
+Cast: `{ "op": "cast", "to": "DOUBLE", "args": [ <expr> ] }` and `{ "op": "try_cast", ... }` for safe casts that return NULL on failure.
+Temporal: `date_trunc`, `date_part`, `date_diff`, `strptime`, `date_add`.
+List: `list_length(expr)`, `list_contains(expr, value)`, `array(value1, value2, ...)`.
+Struct access: `{ "op": "struct_field", "field": "name", "args": [ <expr> ] }` extracts a field from a `STRUCT` expression (e.g. a nested JSON object loaded by `dataframe_load_json`). Nesting is supported.
+Misc: `hash`.
 
-- `{ "column": "name" }` — a column reference.
-- `{ "literal": <value> }` — a constant.
-
-**Operator node** — `{ "op": "<fn>", "args": [ <expr>, ... ] }`. Argument counts are validated:
-
-| Group | operators (arg count) |
-|-------|------------------------|
-| Arithmetic | `add` (≥2), `subtract` (2), `multiply` (≥2), `divide` (2), `modulo` (2), `round` (1–2), `abs` (1), `floor` (1), `ceil` (1), `power` (2), `ln` (1) |
-| String | `concat` (≥2), `upper` (1), `lower` (1), `trim` (1), `substring` (2–3), `length` (1), `replace` (3), `split_part` (3), `lpad` (2–3), `rpad` (2–3), `regexp_replace` (3), `regexp_extract` (2–3), `regexp_matches` (2) |
-| Conditional | `coalesce` (≥1), `nullif` (2), `greatest` (≥2), `least` (≥2), `clip` (3) |
-| Temporal | `date_trunc` (2), `date_part` (2), `date_diff` (3), `strptime` (2), `date_add` (3) |
-| List | `list_length` (1), `list_contains` (2), `array` (≥1) |
-| Misc | `hash` (1) |
-
-**Special nodes:**
-
-- `{ "op": "cast", "to": "<type>", "args": [ <expr> ] }` — cast (aborts on failure).
-- `{ "op": "try_cast", "to": "<type>", "args": [ <expr> ] }` — safe cast (NULL on failure).
-- `{ "op": "case", "when": [ { "predicate": <pred>, "then": <expr> }, ... ], "else": <expr>? }` —
-  searched CASE; each `predicate` is a [predicate tree](#predicate-trees).
-- `{ "op": "struct_field", "field": "name", "args": [ <expr> ] }` — access a STRUCT field.
-
-```jsonc
-// margin = round((revenue - cost) / revenue, 4)
-{
-  "op": "round",
-  "args": [
-    { "op": "divide", "args": [
-      { "op": "subtract", "args": [ { "column": "revenue" }, { "column": "cost" } ] },
-      { "column": "revenue" }
-    ]},
-    { "literal": 4 }
-  ]
-}
-```
-
-```jsonc
-// bucket = CASE WHEN amount >= 1000 THEN 'big' ELSE 'small' END
+`case` uses the predicate grammar for its `when` branches:
+```json
 {
   "op": "case",
   "when": [
-    { "predicate": { "column": "amount", "op": "gte", "value": 1000 }, "then": { "literal": "big" } }
+    { "predicate": { "column": "amount", "op": "gte", "value": 1000 }, "then": { "literal": "high" } },
+    { "predicate": { "column": "amount", "op": "gte", "value": 100 }, "then": { "literal": "medium" } }
   ],
-  "else": { "literal": "small" }
+  "else": { "literal": "low" }
 }
 ```
 
-## Aggregation functions
+`strptime(expr, format)` parses strings to timestamps. `format` is a literal drawn from a closed (but broad) vocabulary covering the common date, date-time, and time layouts — ISO (`%Y-%m-%d`, `%Y-%m-%dT%H:%M:%S`, with optional `.%f`/`Z`), slash/dot/dash variants in both `m/d/Y` and `d/m/Y` order (e.g. `%m/%d/%Y`, `%d.%m.%Y`), month-name forms (`%d %b %Y`, `%B %d, %Y`), compact (`%Y%m%d`, `%Y%m%d%H%M%S`), and time-only (`%H:%M`, `%H:%M:%S`). A format outside the vocabulary returns `INVALID_PREDICATE`.
 
-Used in `dataframe_group_by` aggregation specs (`{ column, function, alias, q?, column2? }`):
+`date_add(unit, n, expr)` adds `n` units to a date/timestamp. `unit` is a literal from `year`, `month`, `day`, `hour`, `minute`, `second` (and their plurals).
 
-| Function | Notes |
-|----------|-------|
-| `count` | Use column `"*"` for a row count. |
-| `count_distinct`, `approx_count_distinct` | Exact / HyperLogLog distinct count. |
-| `sum`, `product`, `avg`, `min`, `max` | |
-| `median`, `mode` | |
-| `stddev`, `stddev_pop`, `stddev_samp`, `var`, `var_pop`, `var_samp` | Dispersion. |
-| `bool_and`, `bool_or` | Boolean aggregates. |
-| `first`, `last`, `list` | First/last value; collect into a LIST. |
-| `quantile`, `approx_quantile` | Require `q` in `[0,1]`. |
-| `corr`, `covar` | Require `column2`. |
-| `arg_min`, `arg_max` | Require `column2`: returns `column` for the row where `column2` is min/max. |
+The function set is fixed and validated; there is no path from caller input to executed code. See [security.md](security.md#injection-free-design).
 
-## Window functions
+## Error codes
 
-Used in `dataframe_window` function specs (`{ function, column?, alias, args? }`):
+All operations share the error contract documented in [tool-contract.md](tool-contract.md#failure-fields). On failure, `r.Success` is `false` and `r.ErrorCode` carries one of the stable codes from `DataFrameErrorCodes` (namespace `Andy.Data`); `r.Message` explains, and `r.Details` may carry structured context. The common codes:
 
-| Function | Notes |
-|----------|-------|
-| `row_number`, `rank`, `dense_rank`, `percent_rank` | Ranking (no `column`). |
-| `ntile` | `args: [n]`. |
-| `lag`, `lead` | Offset access; `column` plus optional offset in `args`. |
-| `first_value`, `last_value` | Boundary values over the frame. |
-| `sum`, `avg`, `min`, `max`, `count` | Aggregates over the window/frame. |
+| Code (`DataFrameErrorCodes`) | Value | Meaning |
+|------|-------|---------|
+| `DatasetNotFound` | `DATASET_NOT_FOUND` | Referenced `dataset_id` is not registered |
+| `ColumnNotFound` | `COLUMN_NOT_FOUND` | A referenced column is not in the dataset schema |
+| `InvalidType` | `INVALID_TYPE` | Operation/operator not valid for a column's type |
+| `InvalidArgument` | `INVALID_ARGUMENT` | A parameter value is malformed or out of vocabulary |
+| `InvalidAggregation` | `INVALID_AGGREGATION` | Unknown or misapplied aggregate function |
+| `InvalidPredicate` | `INVALID_PREDICATE` | Malformed predicate or expression tree |
+| `SchemaMismatch` | `SCHEMA_MISMATCH` | Union/join inputs are not compatible |
+| `FileNotFound` | `FILE_NOT_FOUND` | Source path does not exist |
+| `PermissionDenied` | `PERMISSION_DENIED` | Path outside the policy allow-list, or missing permission |
+| `TargetExists` | `TARGET_EXISTS` | Export target exists and `mode` is not `overwrite` |
+| `Cancelled` | `CANCELLED` | Operation cancelled by caller or exceeded `MaxExecutionTimeMs` |
+| `BackendError` | `BACKEND_ERROR` | DuckDB-level execution error (message included) |
 
-Define the window with `partition_by`, `order_by`, and an optional `frame` — see the
-[`dataframe_window`](#dataframe_window) example.
+Branch on the code, not the message:
+
+```csharp
+var r = engine.Execute("dataframe_filter", parameters);
+if (!r.Success)
+{
+    switch (r.ErrorCode)
+    {
+        case DataFrameErrorCodes.DatasetNotFound: /* load it first */ break;
+        case DataFrameErrorCodes.InvalidPredicate: /* fix the predicate tree */ break;
+        default: throw new InvalidOperationException($"[{r.ErrorCode}] {r.Message}");
+    }
+}
+```
+
+See also: [getting-started.md](getting-started.md), [core-concepts.md](core-concepts.md), [architecture.md](architecture.md), [tool-contract.md](tool-contract.md), [reliability.md](reliability.md), [security.md](security.md), [troubleshooting.md](troubleshooting.md).

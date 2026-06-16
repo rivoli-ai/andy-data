@@ -3,10 +3,10 @@
 `Andy.Data` reads and writes four formats: **CSV**, **JSON**, **Parquet** (including partitioned
 Parquet), and **Delta Lake**. This page collects the format-specific load and export options and the
 behaviors worth knowing for each. For the general operation contract see the
-[operations reference](operations.md); all paths honor the [path policy](concepts.md#path-policy).
+[operations reference](operations.md); all paths honor the [path policy](security.md#the-ipathpolicy-filesystem-gate).
 
 A note that applies to every format: loads register a **lazy view over the file** (see
-[lazy views](concepts.md#lazy-views-read-this-for-performance)). Columnar Parquet scans are pushed
+[lazy views](architecture.md#lazy-views-fold-a-chain-into-one-plan)). Columnar Parquet scans are pushed
 down and are dramatically cheaper to re-read than CSV/JSON — if you load from CSV/JSON and then run a
 multi-step pipeline, consider `export`-ing to Parquet once and continuing from there.
 

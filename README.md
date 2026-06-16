@@ -2,7 +2,20 @@
 
 A structured, deterministic **dataframe engine** backed by [DuckDB](https://duckdb.org/), with **no dependency on any tool framework**. Load, transform, aggregate, join, reshape, and export tabular data (CSV, JSON, Parquet, partitioned Parquet, Delta Lake) through a closed, injection-safe vocabulary — no model-supplied SQL or code execution.
 
-> **ALPHA**. No guarantees about functionality, stability, or safety. Query results have not been fully validated across all types/formats. Do not use in production or for decisions on critical data without independent verification. Use at your own risk. Licensed under [Apache 2.0](LICENSE).
+> **ALPHA RELEASE WARNING**
+>
+> This software is in ALPHA stage. **NO GUARANTEES** are made about its functionality, stability, or safety.
+>
+> **CRITICAL WARNINGS:**
+> - Query results have **NOT BEEN FULLY VALIDATED** across all data types and formats
+> - Schema inference and type coercion may behave unexpectedly on malformed inputs
+> - **DO NOT USE** in production environments
+> - **DO NOT USE** for decisions on critical or irreplaceable data without independent verification
+> - The authors assume **NO RESPONSIBILITY** for incorrect results, data loss, or damages
+>
+> **USE AT YOUR OWN RISK**
+
+Licensed under the [Apache License 2.0](LICENSE).
 
 ## What this is
 
@@ -55,24 +68,37 @@ The 28 operations: load_csv/json/parquet/delta, schema, profile, preview, value_
 
 ## Documentation
 
-Full documentation lives in [`docs/`](docs/):
+Full technical documentation lives in [`docs/`](docs/README.md):
 
-- [Getting started](docs/getting-started.md) — install, first dataset, the execute loop.
-- [Concepts](docs/concepts.md) — engine, datasets, lazy views, catalog, resource limits, concurrency, path policy.
-- [Operations reference](docs/operations.md) — all 28 operations grouped by category, with parameters and examples; includes the [predicate](docs/operations.md#predicate-trees) and [expression](docs/operations.md#expression-trees) tree grammars.
-- [File formats](docs/file-formats.md) — CSV, JSON, Parquet, partitioned Parquet, and Delta Lake (load + export options, partitioning, time travel).
-- [Response & error contract](docs/tool-contract.md) — the response envelope, stats, and the stable error codes.
-- [Benchmarks](docs/benchmarks.md) — performance characteristics, scaling, and known limits, with a reproducible harness in [`benchmarks/`](benchmarks/).
+- [Getting Started](docs/getting-started.md) — build, construct an engine, run your first operation
+- [Core Concepts](docs/core-concepts.md) — datasets, the catalog, the response envelope, lifecycle
+- [Architecture](docs/architecture.md) — layers, SQL rendering, the DuckDB backend
+- [Operations Reference](docs/operations.md) — every operation, with parameters and the predicate/expression grammars
+- [File Formats](docs/file-formats.md) — CSV, JSON, Parquet, partitioned Parquet, and Delta Lake (load + export, partitioning, time travel)
+- [Response Envelope Contract](docs/tool-contract.md) — the stable success/failure shape and error codes
+- [Reliability](docs/reliability.md) — determinism, schema handling, and the error contract
+- [Security](docs/security.md) — the injection-free model and the `IPathPolicy` filesystem gate
+- [Troubleshooting](docs/troubleshooting.md) — common issues and resolutions
+- [Benchmarks](docs/benchmarks.md) — measured performance, scaling, and limits, with a reproducible harness
+
+Runnable end-to-end samples are in [`examples/`](examples/README.md).
 
 ## Status
 
-The framework-independent **engine + operation API** is complete and tested across Ubuntu/macOS/Windows. The `Andy.Tools.Data` integration (the `dataframe_*` LLM tools, shipped from the `andy-tools` repo) and the archival of `andy-tools-dataframe` are tracked in the `andy-tools` repository.
+The framework-independent **engine + operation API** is complete and tested across Ubuntu/macOS/Windows. The Andy.Tools integration (the `dataframe_*` LLM tools, `Andy.Tools.Data`) ships separately from the [`andy-tools`](https://github.com/rivoli-ai/andy-tools) repo and builds on this package; the original [`andy-tools-dataframe`](https://github.com/rivoli-ai/andy-tools-dataframe) repo is being archived in favor of this split.
 
 ## Build & test
 
 ```bash
 dotnet build
 dotnet test
+```
+
+## Examples
+
+```bash
+dotnet run --project examples/Andy.Data.Examples       # run the full scenario suite
+dotnet run --project examples/Andy.Data.Examples -- list
 ```
 
 ## Benchmarks
@@ -82,3 +108,7 @@ dotnet run --project benchmarks/Andy.Data.Benchmarks -c Release -- 100000,100000
 ```
 
 See [docs/benchmarks.md](docs/benchmarks.md) for measured results and analysis.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).

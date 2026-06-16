@@ -10,7 +10,7 @@ not to publish a rigorous, machine-normalized benchmark suite.
 synthetic data (`id, region, category, amount, qty, ts`; 5 regions × 20 categories) at several row
 counts, then times each operation as the **median of N repetitions** with a warm-up pass off the
 clock. Each measurement is a full `engine.Execute(...)` call — so it includes the operation **plus the
-row count and preview that every response carries** (the [terminals](concepts.md#lazy-views-read-this-for-performance)
+row count and preview that every response carries** (the [terminals](architecture.md#lazy-views-fold-a-chain-into-one-plan)
 that force the lazy plan to execute).
 
 Two deliberate choices shape the numbers:
@@ -71,7 +71,7 @@ need, and prefer narrower partitions / lower-cardinality order keys for windows.
 ### The source format dominates derived cost
 
 This is the single most important performance fact about the library, and it follows directly from the
-[lazy-view model](concepts.md#lazy-views-read-this-for-performance): a load registers a **view over the
+[lazy-view model](architecture.md#lazy-views-fold-a-chain-into-one-plan): a load registers a **view over the
 source file**, and a transform over it is a view over that view. The row count and preview that every
 response returns then **re-execute the chain from the source**.
 
@@ -93,14 +93,14 @@ chain-depth checkpointing to materialize long chains.
 ## Limits & guidance
 
 - **In-memory engine.** The default backend is in-memory DuckDB; the working set must fit in RAM
-  (DuckDB spills to a temp dir past the [`MaxMemoryBytes`](concepts.md#resource-governance--cancellation)
+  (DuckDB spills to a temp dir past the [`MaxMemoryBytes`](core-concepts.md#resource-governance-and-cancellation)
   limit, trading speed for capacity). The 10 M-row scale here pushed process RSS to ~6 GB.
 - **Bound big operations.** Set `MaxMemoryBytes` and `MaxExecutionTimeMs` for untrusted or unbounded
   workloads; a runaway op returns `CANCELLED` rather than exhausting the host.
 - **Previews are bounded (≤ 50 rows in a response, ≤ 1000 via `preview`).** Don't treat the preview as
   the result set; the full result lives in the engine under its `dataset_id`.
 - **One connection per engine.** A single engine serializes operations (parallelism is *intra*-query).
-  For concurrent independent pipelines, use one [engine per stream](concepts.md#concurrency).
+  For concurrent independent pipelines, use one [engine per stream](core-concepts.md#concurrency).
 - **Ordering is the cost center.** `sort` and `window` dominate at scale; everything else is cheap by
   comparison.
 
