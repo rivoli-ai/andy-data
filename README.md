@@ -53,9 +53,20 @@ Each operation is also usable directly (e.g. `new FilterOperation(backend, catal
 
 The 28 operations: load_csv/json/parquet/delta, schema, profile, preview, value_counts, assert, select, filter, with_column, rename, group_by, window, pivot, unpivot, unnest, join, sample, sort, distinct, union, fillna, dropna, export, list, drop.
 
+## Documentation
+
+Full documentation lives in [`docs/`](docs/):
+
+- [Getting started](docs/getting-started.md) — install, first dataset, the execute loop.
+- [Concepts](docs/concepts.md) — engine, datasets, lazy views, catalog, resource limits, concurrency, path policy.
+- [Operations reference](docs/operations.md) — all 28 operations grouped by category, with parameters and examples; includes the [predicate](docs/operations.md#predicate-trees) and [expression](docs/operations.md#expression-trees) tree grammars.
+- [File formats](docs/file-formats.md) — CSV, JSON, Parquet, partitioned Parquet, and Delta Lake (load + export options, partitioning, time travel).
+- [Response & error contract](docs/tool-contract.md) — the response envelope, stats, and the stable error codes.
+- [Benchmarks](docs/benchmarks.md) — performance characteristics, scaling, and known limits, with a reproducible harness in [`benchmarks/`](benchmarks/).
+
 ## Status
 
-The framework-independent **engine + operation API** is complete and tested across Ubuntu/macOS/Windows. The `Andy.Tools.Data` integration (the `dataframe_*` LLM tools, shipped from the `andy-tools` repo) and the archival of `andy-tools-dataframe` are the remaining phases — see [MIGRATION.md](MIGRATION.md).
+The framework-independent **engine + operation API** is complete and tested across Ubuntu/macOS/Windows. The `Andy.Tools.Data` integration (the `dataframe_*` LLM tools, shipped from the `andy-tools` repo) and the archival of `andy-tools-dataframe` are tracked in the `andy-tools` repository.
 
 ## Build & test
 
@@ -63,3 +74,11 @@ The framework-independent **engine + operation API** is complete and tested acro
 dotnet build
 dotnet test
 ```
+
+## Benchmarks
+
+```bash
+dotnet run --project benchmarks/Andy.Data.Benchmarks -c Release -- 100000,1000000,5000000 5
+```
+
+See [docs/benchmarks.md](docs/benchmarks.md) for measured results and analysis.
